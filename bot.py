@@ -17,8 +17,8 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-BOT_TOKEN = "9184524998:AAHFBLU85WWV-3ArSduiCp9CdyERwWYjvgE"
-URL_WEBAPP = "https://candy25max.github.io/upgrade/"  # Посилання на твій задеплоєний index.html
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9184524998:AAHFBLU85WWV-3ArSduiCp9CdyERwWYjvgE")
+URL_WEBAPP = os.getenv("URL_WEBAPP", "https://python-six-beige.vercel.app")
 ADMIN_IDS: set[int] = {7828950337}
 DATA_FILE = "bot_data.json"
 
@@ -29,12 +29,29 @@ DEFAULT_CASES: dict[str, dict] = {
     "blok": {"name": "Блок", "price": 259, "reward_min": 30, "reward_max": 700},
 }
 
+DEFAULT_PROMOS: dict[str, int] = {
+    "GLIMUP100": 100,
+    "START50": 50,
+}
 
-def write_json_file(users: dict[int, int], cases: dict[str, dict]) -> None:
-    """Атомарно записує баланси користувачів та ціни кейсів у bot_data.json."""
+
+def write_json_file(
+    users: dict[int, dict],
+    cases: dict[str, dict],
+    promos: dict[str, int] | None = None,
+) -> None:
+    """Атомарно записує баланси/мови/промокоди користувачів та ціни кейсів у bot_data.json."""
     payload = {
-        "users": {str(k): int(v) for k, v in users.items()},
+        "users": {
+            str(k): {
+                "balance": int(v.get("balance", 0)),
+                "lang": v.get("lang") if v.get("lang") in ("ru", "en") else None,
+                "used_promos": list(v.get("used_promos", [])),
+            }
+            for k, v in users.items()
+        },
         "cases": cases,
+        "promos": promos if promos is not None else DEFAULT_PROMOS,
     }
     tmp_file = f"{DATA_FILE}.tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
@@ -42,25 +59,40 @@ def write_json_file(users: dict[int, int], cases: dict[str, dict]) -> None:
     os.replace(tmp_file, DATA_FILE)
 
 
-def load_data() -> tuple[dict[int, int], dict[str, dict]]:
-    """Завантажує баланси та кейси з JSON-файлу."""
+def load_data() -> tuple[dict[int, dict], dict[str, dict], dict[str, int]]:
+    """Завантажує дані користувачів, кейси та промокоди з JSON-файлу."""
     if not os.path.exists(DATA_FILE):
         cases_copy = {k: dict(v) for k, v in DEFAULT_CASES.items()}
-        write_json_file({}, cases_copy)
-        return {}, cases_copy
+        promos_copy = dict(DEFAULT_PROMOS)
+        write_json_file({}, cases_copy, promos_copy)
+        return {}, cases_copy, promos_copy
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except (json.JSONDecodeError, OSError):
         cases_copy = {k: dict(v) for k, v in DEFAULT_CASES.items()}
-        return {}, cases_copy
+        promos_copy = dict(DEFAULT_PROMOS)
+        return {}, cases_copy, promos_copy
 
     raw_users = raw.get("users", {})
-    users: dict[int, int] = {}
-    for uid_str, bal in raw_users.items():
+    users: dict[int, dict] = {}
+    for uid_str, val in raw_users.items():
         if str(uid_str).isdigit():
-            users[int(uid_str)] = int(bal)
+            uid = int(uid_str)
+            if isinstance(val, dict):
+                lang_val = val.get("lang")
+                users[uid] = {
+                    "balance": int(val.get("balance", 0)),
+                    "lang": lang_val if lang_val in ("ru", "en") else None,
+                    "used_promos": [str(p).upper() for p in val.get("used_promos", [])],
+                }
+            else:
+                users[uid] = {
+                    "balance": int(val),
+                    "lang": None,
+                    "used_promos": [],
+                }
 
     raw_cases = raw.get("cases", {})
     cases: dict[str, dict] = {}
@@ -73,20 +105,28 @@ def load_data() -> tuple[dict[int, int], dict[str, dict]]:
             "reward_max": int(saved_cfg.get("reward_max", default_cfg["reward_max"])),
         }
 
-    return users, cases
+    raw_promos = raw.get("promos", DEFAULT_PROMOS)
+    promos: dict[str, int] = {}
+    if isinstance(raw_promos, dict):
+        for code, reward in raw_promos.items():
+            if str(code).strip() and int(reward) > 0:
+                promos[str(code).strip().upper()] = int(reward)
+    if not promos:
+        promos = dict(DEFAULT_PROMOS)
+
+    return users, cases, promos
 
 
-users_db, cases_db = load_data()
+users_db, cases_db, promos_db = load_data()
 
 
 def save_data() -> None:
-    write_json_file(users_db, cases_db)
+    write_json_file(users_db, cases_db, promos_db)
 
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Стани очікування текстового вводу від користувачів або адміна
 pending_inputs: dict[int, dict] = {}
 
 
@@ -94,32 +134,81 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def get_user_balance(user_id: int) -> int:
+def ensure_user(user_id: int) -> dict:
     if user_id not in users_db:
-        users_db[user_id] = 100  # Стартовий баланс для нового користувача
+        users_db[user_id] = {
+            "balance": 0,
+            "lang": None,
+            "used_promos": [],
+        }
         save_data()
     return users_db[user_id]
 
 
+def get_user_lang(user_id: int) -> str:
+    rec = ensure_user(user_id)
+    return rec["lang"] if rec["lang"] in ("ru", "en") else "ru"
+
+
+def set_user_lang(user_id: int, lang: str) -> None:
+    rec = ensure_user(user_id)
+    rec["lang"] = "en" if lang == "en" else "ru"
+    save_data()
+
+
+def get_user_balance(user_id: int) -> int:
+    rec = ensure_user(user_id)
+    return int(rec.get("balance", 0))
+
+
 def set_user_balance(user_id: int, new_balance: int) -> None:
-    users_db[user_id] = max(0, int(new_balance))
+    rec = ensure_user(user_id)
+    rec["balance"] = max(0, int(new_balance))
     save_data()
 
 
 def build_webapp_url(user_id: int) -> str:
     bal = get_user_balance(user_id)
+    lang = get_user_lang(user_id)
     prices_map = {cid: cfg["price"] for cid, cfg in cases_db.items()}
     encoded_prices = base64.urlsafe_b64encode(
         json.dumps(prices_map, ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
     sep = "&" if "?" in URL_WEBAPP else "?"
-    return f"{URL_WEBAPP}{sep}balance={bal}&prices={encoded_prices}"
+    return f"{URL_WEBAPP}{sep}balance={bal}&lang={lang}&prices={encoded_prices}"
+
+
+def lang_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Русский (RU)", callback_data="set_lang:ru"),
+                InlineKeyboardButton(text="English (EN)", callback_data="set_lang:en"),
+            ]
+        ]
+    )
 
 
 def main_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
+    lang = get_user_lang(user_id)
+    if lang == "en":
+        open_text = "Открыть GlimUp"
+        topup_text = "Пополнить"
+        promo_text = "Промокод"
+        lang_text = "Сменить язык"
+    else:
+        open_text = "Открыть GlimUp"
+        topup_text = "Пополнить"
+        promo_text = "Промокод"
+        lang_text = "Сменить язык"
+
     rows = [
-        [KeyboardButton(text="📦 Відкрити кейси", web_app=WebAppInfo(url=build_webapp_url(user_id)))],
-        [KeyboardButton(text="⭐ Поповнити")],
+        [KeyboardButton(text=open_text, web_app=WebAppInfo(url=build_webapp_url(user_id)))],
+        [
+            KeyboardButton(text=topup_text),
+            KeyboardButton(text=promo_text),
+        ],
+        [KeyboardButton(text=lang_text)],
     ]
     if is_admin(user_id):
         rows.append([KeyboardButton(text="🛠 Адмін-панель")])
@@ -140,11 +229,11 @@ def topup_amounts_kb() -> InlineKeyboardMarkup:
 
 
 def admin_panel_kb() -> InlineKeyboardMarkup:
-    # Кнопки зміни зображення в налаштуваннях немає за умовою
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💰 Видати / змінити баланс", callback_data="admin_set_balance")],
             [InlineKeyboardButton(text="🎯 Змінити ціну кейсу", callback_data="admin_edit_prices")],
+            [InlineKeyboardButton(text="🎟 Додати промокод", callback_data="admin_add_promo")],
             [InlineKeyboardButton(text="📊 Статистика бота", callback_data="admin_stats")],
         ]
     )
@@ -167,8 +256,8 @@ def admin_cases_price_kb() -> InlineKeyboardMarkup:
 async def send_stars_invoice(chat_id: int, stars_amount: int) -> None:
     await bot.send_invoice(
         chat_id=chat_id,
-        title="Поповнення балансу",
-        description=f"Поповнення балансу на {stars_amount} ⭐",
+        title="Пополнение баланса",
+        description=f"Пополнение баланса на {stars_amount} ⭐",
         payload=json.dumps({"action": "topup", "stars": stars_amount}),
         provider_token="",
         currency="XTR",
@@ -176,19 +265,53 @@ async def send_stars_invoice(chat_id: int, stars_amount: int) -> None:
     )
 
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message) -> None:
-    uid = message.from_user.id
-    bal = get_user_balance(uid)
-    await message.answer(
-        f"Привіт! Твій баланс: <b>{bal} ⭐</b>\n"
-        f"Натискай <b>«📦 Відкрити кейси»</b> або <b>«⭐ Поповнити»</b>:",
-        parse_mode="HTML",
-        reply_markup=main_menu_kb(uid),
+async def send_language_selected_menu(chat_id: int, user_id: int) -> None:
+    rec = ensure_user(user_id)
+    chosen_lang = rec["lang"] if rec["lang"] in ("ru", "en") else "ru"
+    bal = get_user_balance(user_id)
+    lang_label = "Русский" if chosen_lang == "ru" else "English"
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"Язык выбран: {lang_label}. Баланс: {bal} ⭐",
+        reply_markup=main_menu_kb(user_id),
     )
 
 
-@dp.message(F.text == "⭐ Поповнити")
+@dp.message(Command("start"))
+async def cmd_start(message: Message) -> None:
+    uid = message.from_user.id
+    ensure_user(uid)
+    await message.answer(
+        "Выберите ваш язык / Choose your language:",
+        reply_markup=lang_choice_kb(),
+    )
+
+
+@dp.callback_query(F.data.startswith("set_lang:"))
+async def cb_set_lang(callback: CallbackQuery) -> None:
+    await callback.answer()
+    uid = callback.from_user.id
+    chosen = callback.data.split(":", 1)[1]
+    set_user_lang(uid, chosen)
+    await send_language_selected_menu(callback.message.chat.id, uid)
+
+
+@dp.message(F.text == "Сменить язык")
+async def btn_change_lang(message: Message) -> None:
+    await message.answer(
+        "Выберите ваш язык / Choose your language:",
+        reply_markup=lang_choice_kb(),
+    )
+
+
+@dp.message(F.text == "Промокод")
+async def btn_promo(message: Message) -> None:
+    uid = message.from_user.id
+    pending_inputs[uid] = {"mode": "enter_promo"}
+    await message.answer("Введите промокод:")
+
+
+@dp.message(F.text == "Пополнить")
 async def btn_topup(message: Message) -> None:
     await message.answer(
         "Оберіть, скільки зірок хочете поповнити:",
@@ -274,13 +397,25 @@ async def cb_admin_choose_case_price(callback: CallbackQuery) -> None:
     )
 
 
+@dp.callback_query(F.data == "admin_add_promo")
+async def cb_admin_add_promo(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        return
+    await callback.answer()
+    pending_inputs[callback.from_user.id] = {"mode": "admin_add_promo"}
+    await callback.message.answer(
+        "Надішліть у форматі: <code>КОД ЗІРКИ</code>\nНаприклад: <code>BONUS200 200</code>",
+        parse_mode="HTML",
+    )
+
+
 @dp.callback_query(F.data == "admin_stats")
 async def cb_admin_stats(callback: CallbackQuery) -> None:
     if not is_admin(callback.from_user.id):
         return
     await callback.answer()
     total_users = len(users_db)
-    total_stars = sum(users_db.values())
+    total_stars = sum(int(u.get("balance", 0)) for u in users_db.values())
     await callback.message.answer(
         f"📊 <b>Статистика</b>\n"
         f"Користувачів у базі: <b>{total_users}</b>\n"
@@ -369,7 +504,7 @@ async def handle_webapp_data(message: Message) -> None:
             )
 
 
-# --- Текстовий ввід для поповнення та адмін-панелі ---
+# --- Текстовий ввід для промокодів, поповнення та адмін-панелі ---
 @dp.message(F.text)
 async def handle_pending_text(message: Message) -> None:
     uid = message.from_user.id
@@ -379,6 +514,29 @@ async def handle_pending_text(message: Message) -> None:
 
     mode = state["mode"]
     raw = message.text.strip()
+
+    if mode == "enter_promo":
+        pending_inputs.pop(uid, None)
+        code = raw.upper()
+        reward = promos_db.get(code)
+        if not reward:
+            await message.answer("❌ Промокод не знайдено або недійсний.", reply_markup=main_menu_kb(uid))
+            return
+        rec = ensure_user(uid)
+        used = rec.setdefault("used_promos", [])
+        if code in used:
+            await message.answer("⚠️ Ви вже активували цей промокод.", reply_markup=main_menu_kb(uid))
+            return
+        used.append(code)
+        new_bal = get_user_balance(uid) + reward
+        set_user_balance(uid, new_bal)
+        await message.answer(
+            f"✅ Промокод <b>{code}</b> активовано! Нараховано: <b>+{reward} ⭐</b>\n"
+            f"Поточний баланс: <b>{new_bal} ⭐</b>",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(uid),
+        )
+        return
 
     if mode == "custom_topup":
         if not raw.isdigit() or int(raw) < 1:
@@ -417,6 +575,25 @@ async def handle_pending_text(message: Message) -> None:
         pending_inputs.pop(uid, None)
         await message.answer(
             f"✅ Нова ціна кейсу <b>{cases_db[case_id]['name']}</b> збережена: <b>{new_price} ⭐</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    if mode == "admin_add_promo" and is_admin(uid):
+        parts = raw.split()
+        if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) < 1:
+            await message.answer(
+                "Формат: <code>КОД ЗІРКИ</code> (наприклад: <code>BONUS200 200</code>)",
+                parse_mode="HTML",
+            )
+            return
+        code = parts[0].upper()
+        reward = int(parts[1])
+        promos_db[code] = reward
+        save_data()
+        pending_inputs.pop(uid, None)
+        await message.answer(
+            f"✅ Промокод <b>{code}</b> на <b>{reward} ⭐</b> додано.",
             parse_mode="HTML",
         )
 
